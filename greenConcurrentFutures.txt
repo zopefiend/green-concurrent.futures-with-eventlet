@@ -1,0 +1,113 @@
+
+'''
+	Re. Greening Concurrent Futures with Eventlet, 
+            for massively asynchronous:  
+
+                HTTP sessions (get(s), etc.)
+
+                parallel map sequences
+
+                discrete processes
+
+                callbacks, etc.
+
+
+The config below sets up 'greened' concurrent futures for use as 'executors', 
+and 'requests' sessions'. This may not be the only way to achieve the same 
+results, or even the best way, it is just one way that is known to work ...
+'''
+# UNTESTED! based on working code, BUT, just an example, nothing more ...
+
+import eventlet
+eventlet.patcher.monkey_patch(os=False, socket=True, select=True, thread=True)
+from collections import deque
+import json
+import requests
+
+# Note: concurrent.futures is NOT imported directly, see next line.
+futures = eventlet.import_patched('concurrent.futures') # 'greening' futures,
+
+# Note: requests_futures.sessions is NOT imported directly, see next line.
+req_f_sess = eventlet.import_patched('requests_futures.sessions') # green requests
+
+# Green ThreadPoolExecutor object for sessions, map, submit, callback, etc.
+fut_tp_exec = futures.ThreadPoolExecutor
+
+# init requests session Executor object, with a 'modest' max workers setting
+o_rest_sess = req_f_sess.FuturesSession(executor=fut_tp_exec(max_workers=5000))
+
+f_nap = eventlet.sleep                        # green thread co-op 'yield'
+n_ap = 0                                      # 0 = canonical 'yield value'
+
+
+#just what it says, returns a function + 'closed over' param(s)
+def f_closure(f_unc, *args):    
+  def f_closed1(one_arg):                     # one_arg == future, mapped sequence
+      return f_unc(one_arg, *args) 
+  return f_closed1
+''' 
+the above is used to work around a limitation of future.add_done_callback, 
+which only accepts the future itself, as the sole allowed parameter, also
+(e.g.) a ThreadPoolExecutor.map(f_unction, it_erator) .
+'''
+ 
+
+#e.g. requests sessions for async HTTP get(s)
+
+def f_json2py(o_resp):                       # called in 'background', 
+    o_resp.data = o_resp.json()              # convert JSON -> Python
+
+
+def f_py2json(o_py):                         # called async,
+    return json.dumps(o_py)                  # convert Python -> JSON
+
+
+ld_deq_in = deque()                          # fast, thread-safe append / pop
+m_in_apnd = ld_deq_in.append                 # prevent method lookup inside loop
+
+
+def f_http_get(s_url, m_apndeq):             # init one session per func call
+    '''
+    m_apndeq was added as a static arg via f_closure()
+
+    static here means that the same arg object(s) apply to all maps, 
+    unlike the mapped iterator itself, where a single item of the 
+    sequence is handled at each pass of the map process
+    '''
+
+    o_fut_resp = o_rest_sess.get(s_url, timeout=90, background_callback=f_json2py)
+    f_nap(n_ap)                              # yield control to other greenlets
+    m_apndeq(o_fut_resp.data)
+
+
+
+f_closed_with_deq = f_closure(f_http_get, m_in_apnd) # how to sneak extra params
+
+l_urls = [ list | generator | iterator of HTTP 'links' to be 'hit' ]
+n_len = len(l_urls) + 2                      # TPExecutor itself uses one worker
+
+# green ThreadPoolExecutor runs HTTP get sessions as async mapped functions
+with fut_tp_exec(max_workers=n_len) as tp_exec_mapper: # a context manager
+    '''
+    async function maps over items in sequence, only allows two params:
+    the function to be mapped, and the sequence to dynamically map 'over'. 
+    f_closure(), above enables additional static params.
+    '''
+
+    tp_exec_mapper.map(f_closed_with_deq, l_urls)
+
+# context 'clean-up' (__exit__ method) complete, all mapped processes finished
+n_len = len(ld_deq_in)
+ld_deq_out = deque()
+m_out_apnd = ld_deq_out.append
+
+
+# green ThreadPoolExecutor runs discrete async functions, short ones finish quicker!
+with fut_tp_exec(max_workers=n_len+2) as tp_exec_discrete: # YA context manager
+    while ld_deq_in:
+        m_out_apnd(tp_exec_discrete.submit(f_py2json, ld_deq_in.popleft())
+
+# context 'clean-up' (__exit__ method) complete, all discrete processes finished
+for s_json in ld_deq_out():
+    if s_json:
+        print '\n', s_json.result(), '\n'   # when .result() must be called ?
